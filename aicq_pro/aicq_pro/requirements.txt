@@ -1,0 +1,9 @@
+# 版本範圍為『預期相容』的下限/上限，開發沙盒無法連網，未能在此環境逐一安裝驗證。
+# 沙盒內實測過的核心依賴版本：numpy 2.4.4、pandas 3.0.2、python-dotenv 1.2.2（Python 3.12.3）
+streamlit>=1.40,<2
+ccxt>=4.4,<5
+pandas>=2.2,<4
+numpy>=1.26,<3
+plotly>=5.24,<7
+python-dotenv>=1.0,<2
+pytest>=8,<10
