@@ -43,8 +43,9 @@ class _Cache:
 
 
 class StubST:
-    def __init__(self, radio_idx=0, press=()):
+    def __init__(self, radio_idx=0, press=(), sliders=None):
         self.session_state, self.radio_idx, self.press = _SS(), radio_idx, press
+        self.sliders = sliders or {}
         self.sidebar = _Ctx(self)
         self.cache_data = _Cache()
         self.calls = []
@@ -56,7 +57,7 @@ class StubST:
         return list(options)[index]
 
     def slider(self, label, mn, mx, value=None, **k):
-        return value
+        return self.sliders.get(label, value)
 
     def checkbox(self, label, value=False, **k):
         return value
@@ -91,15 +92,15 @@ class StubST:
         return f
 
 
-def _run(radio_idx, press=()):
-    stub = StubST(radio_idx, press)
+def _run(radio_idx, press=(), sliders=None):
+    stub = StubST(radio_idx, press, sliders)
     saved = {k: sys.modules.get(k) for k in ("streamlit", "plotly", "plotly.graph_objects", "plotly.subplots")}
     sys.modules.update({"streamlit": stub, "plotly": MagicMock(), "plotly.graph_objects": MagicMock(),
                         "plotly.subplots": MagicMock()})
     d = tempfile.mkdtemp()
     os.environ["AICQ_DB_PATH"] = os.path.join(d, "ui.db")
     try:
-        runpy.run_path("app.py", run_name="__main__")
+        runpy.run_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app.py"), run_name="__main__")
     finally:
         for k, v in saved.items():
             if v is None:
@@ -118,3 +119,10 @@ def test_ui_live_mode_without_network_shows_offline_and_does_not_crash():
 def test_ui_synthetic_mode_all_tabs_and_buttons():
     s = _run(radio_idx=1, press=("執行回測", "更新持倉", "建立模擬單", "套用設定"))
     assert "warning" in s.calls and "dataframe" in s.calls and "plotly_chart" in s.calls
+
+
+def test_ui_backtest_with_selection_and_walkforward_paths():
+    """4000 根 → 觸發三段式選參、Walk-forward、判定顯示等新程式路徑；結束後回測紀錄必須已寫入資料庫。"""
+    s = _run(radio_idx=1, press=("執行回測",), sliders={"K 線根數": 4000})
+    assert s.session_state["bt"]["selection"]["n_trials"] == 9
+    assert "wf_verdict" in s.session_state["bt"] and s.session_state["bt"]["n_backtests_so_far"] == 1

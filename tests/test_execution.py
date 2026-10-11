@@ -20,7 +20,8 @@ T0 = pd.Timestamp("2026-03-01 00:00", tz="UTC")
 
 def _sig(key="k1", side="long", entry=100.0, stop=99.0, tp=102.0):
     return TradeSignal(symbol="T", exchange="x", timeframe="15m", direction=side, direction_label="做多",
-                       signal_key=key, entry_ref=entry, stop=stop, tp1=tp, strategy="trend", data_source="synthetic")
+                       signal_key=key, entry_ref=entry, stop=stop, tp1=tp, strategy="trend", data_source="synthetic",
+                       bar_time=(T0 - pd.Timedelta(minutes=15)).isoformat())    # 剛收盤的 K 線
 
 
 def _db():
