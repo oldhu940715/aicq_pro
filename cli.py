@@ -19,7 +19,7 @@ from aicq.data.provider import MarketData
 from aicq.data.validation import drop_incomplete_last_bar, validate_ohlcv
 from aicq.models import default_instrument
 from aicq.services import load_market, run_validation_suite
-from aicq.timeutil import now_utc, tf_ms, to_ms
+from aicq.timeutil import now_utc, to_ms
 
 
 def cmd_download(a, cfg):
@@ -64,11 +64,21 @@ def cmd_backtest(a, cfg):
         base = MarketData(a.symbol, a.timeframe, df, "live", q, "快取歷史資料")
         htf = MarketData(a.symbol, cfg.htf, hdf, "live", None, "快取") if len(hdf) else None
         inst = default_instrument(a.symbol)
-    out = run_validation_suite(cfg, base, htf, a.timeframe, inst, cfg.params, BacktestConfig())
+    from aicq.execution.storage import Storage
+    out = run_validation_suite(cfg, base, htf, a.timeframe, inst, cfg.params, BacktestConfig(), storage=Storage(cfg.db_path))
     pd.set_option("display.width", 200)
     print("\n== 分段績效 ==")
     print(pd.DataFrame({k: v[1] for k, v in out["segments"].items()}).to_string())
-    print("\n== 成本敏感度（樣本外） ==")
+    v = out["default_oos_verdict"]
+    print(f"\n預設參數後段樣本外判定：{v['status']}；" + "；".join(v["reasons"]))
+    if "selection" in out:
+        s = out["selection"]
+        print(f"\n== 三段式選參（試驗 {s['n_trials']} 組參數）==\n{s['message']}")
+        print(s["table"].round(3).to_string(index=False))
+        print("判定：", out["selection_verdict"]["status"], "；".join(out["selection_verdict"]["reasons"]))
+        print("Walk-forward 判定：", out["wf_verdict"]["status"], "；".join(out["wf_verdict"]["reasons"]))
+    print(f"\n本次為第 {out['n_backtests_so_far']} 次回測（資料指紋 {out['fingerprint']}）。次數越多，樣本外越不獨立。")
+    print("\n== 成本敏感度（預設參數、後段樣本外） ==")
     print(out["cost_sensitivity"].round(4).to_string(index=False))
     if "walk_forward" in out:
         print("\n== Walk-forward 各折 ==")

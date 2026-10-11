@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from aicq.backtest.metrics import buy_hold_curve
 from aicq.config import BacktestConfig, CostConfig, RiskConfig, StrategyParams, load_config
 from aicq.execution.guard import live_status_message
 from aicq.models import DataGate
@@ -86,6 +85,8 @@ else:
     st.success(f"行情正常｜{cfg.exchange_id}｜{symbol}｜最後 K 線 {fmt_taipei(base.df.index[-1])}")
 
 broker = get_broker(cfg)
+if base.source == "offline" and len(broker.db.positions("open")):
+    st.error("⚠ 行情離線，但仍有未平倉的模擬持倉：目前無法監控止損／止盈，恢復連線後請立即更新持倉。")
 marks = {symbol: float(base.df["close"].iloc[-1])} if len(base.df) else {}
 account = broker.account_state(marks)
 signal = analyze_symbol(symbol, base_tf, base, htf, inst, account, cfg)
@@ -184,12 +185,13 @@ with tabs[3]:
     st.subheader("策略回測與樣本外驗證")
     if base.source == "synthetic":
         st.warning("目前為合成測試資料：回測結果只能驗證程式流程，不能用來判斷策略是否有效。")
-    st.caption("流程：訓練 50%／驗證 20%／樣本外 30%（依時間先後，間隔空窗）＋ Walk-forward 滾動驗證 ＋ 成本敏感度。"
+    st.caption("流程：依時間切成 前50%訓練／中20%驗證／後30%樣本外（間隔空窗）；三段式選參只在訓練段選、驗證段把關、樣本外凍結後只評估一次；"
+               "另有 Walk-forward 與成本敏感度。"
                "進場於訊號下一根開盤；同K線雙觸一律先算止損；含手續費、滑價、資金費。")
     if st.button("執行回測（可能需要數十秒）"):
         with st.spinner("回測中…"):
             try:
-                ss["bt"] = run_validation_suite(cfg, base, htf, base_tf, inst, cfg.params, BacktestConfig())
+                ss["bt"] = run_validation_suite(cfg, base, htf, base_tf, inst, cfg.params, BacktestConfig(), storage=broker.db)
                 ss["bt_label"] = f"{symbol} {base_tf} {base.source} {len(base.df)} 根"
             except Exception as e:  # noqa: BLE001
                 st.error(f"回測失敗：{type(e).__name__}: {e}")
@@ -197,18 +199,26 @@ with tabs[3]:
     if bt:
         st.caption(f"結果對應：{ss.get('bt_label')}")
         fm = bt["full_metrics"]
-        oos = bt["segments"]["樣本外"][1]
-        if oos["n_trades"] == 0:
-            st.warning("樣本外沒有任何成交交易：無法評估期望值。這是如實結果，不代表策略有效。")
-        elif not oos["expectancy_r"] > 0:
-            st.error("樣本外每筆期望值（扣成本）≤ 0：沒有證據顯示此策略有正期望值。")
-        else:
-            st.info("樣本外期望值為正，但仍需更長期、跨行情、跨標的驗證；請勿視為獲利保證。")
+        n_runs = bt.get("n_backtests_so_far", 1)
+        st.caption(f"資料指紋 {bt.get('fingerprint')}｜這是累計第 {n_runs} 次回測紀錄")
+        if n_runs >= 5:
+            st.warning(f"你已累計執行 {n_runs} 次回測／調參。試驗次數越多，『挑到運氣好的設定』的機率越高，"
+                       "樣本外結果會逐漸失去獨立性；請以全新資料（之後才發生的行情）做最終確認。")
+        def _show_verdict(title, v):
+            fn = st.success if v["status"].startswith("通過") else (st.warning if v["status"] in ("證據不足", "未驗證") else st.error)
+            fn(f"**{title}：{v['status']}**\n\n" + "\n".join(f"- {r}" for r in v["reasons"]))
+        _show_verdict("預設參數・後段樣本外判定", bt["default_oos_verdict"])
+        if "selection" in bt:
+            sel = bt["selection"]
+            st.markdown(f"**三段式選參（試驗 {sel['n_trials']} 組）**：{sel['message']}")
+            st.dataframe(sel["table"])
+            _show_verdict("選參後・樣本外判定", bt["selection_verdict"])
+            _show_verdict("Walk-forward 合併樣本外判定", bt["wf_verdict"])
         st.plotly_chart(charts.equity_figure({"策略（全期間）": bt["full"].equity, "買入持有": bt["benchmark"]}))
         st.plotly_chart(charts.drawdown_figure(bt["full"].equity))
         st.markdown("**全期間績效**")
         st.dataframe(_metrics_table(fm))
-        st.markdown("**分段績效（訓練／驗證／樣本外）**")
+        st.markdown("**分段績效（預設參數，三段都沒有被調校；僅看穩定性）**")
         st.dataframe(pd.DataFrame({k: v[1] for k, v in bt["segments"].items()}).astype(str))
         st.markdown("**成本敏感度（樣本外）**")
         st.dataframe(bt["cost_sensitivity"])
@@ -231,9 +241,12 @@ with tabs[3]:
 with tabs[4]:
     st.subheader("模擬帳戶")
     if st.button("以最新已收盤 K 線更新持倉（檢查止損／止盈）"):
-        closed = broker.update({symbol: base.df})
-        broker.db.add_equity_point(broker.equity(marks))
-        st.success(f"已更新；本次平倉 {len(closed)} 筆")
+        if base.source == "offline" or not base.ok:
+            st.error("行情離線或資料品質異常，已拒絕更新持倉（避免用過期資料判斷止損／止盈）。")
+        else:
+            closed = broker.update({symbol: base.df})
+            broker.db.add_equity_point(broker.equity(marks))
+            st.success(f"已更新；本次平倉 {len(closed)} 筆")
     acct = broker.account_state(marks)
     pos = broker.db.positions("open")
     cl = broker.db.positions("closed")
@@ -242,10 +255,7 @@ with tabs[4]:
     k2.metric("已實現損益", f"{broker.realized_pnl():+,.2f}")
     k3.metric("今日損益", f"{acct.daily_pnl_pct:+.2f}%")
     eqp = broker.db.equity_points()
-    dd = 0.0
-    if len(eqp) > 1:
-        dd = float(((eqp.equity.cummax() - eqp.equity) / eqp.equity.cummax()).max() * 100)
-    k4.metric("最大回撤（紀錄點）", f"{dd:.2f}%")
+    k4.metric("最大回撤（已實現權益）", f"{broker.max_drawdown_pct():.2f}%", help="由已平倉交易推導，不受是否按過『更新』影響")
     if acct.halted_strategies:
         st.error(f"因回撤超過 {risk.strategy_max_drawdown_pct}% 停用的策略：{', '.join(acct.halted_strategies)}")
     st.markdown("**持倉**")
@@ -256,11 +266,11 @@ with tabs[4]:
         if st.button("以最新價手動平倉"):
             broker.close_manual(int(pid), marks.get(pos[pos.id == pid].iloc[0].symbol, 0.0))
             st.rerun()
-    if len(eqp) > 1:
-        eqs = pd.Series(eqp.equity.values, index=pd.to_datetime(eqp.ts, utc=True))
-        st.plotly_chart(charts.equity_figure({"模擬資金曲線": eqs}))
+    curve = broker.equity_curve()
+    if len(curve) > 1:
+        st.plotly_chart(charts.equity_figure({"已實現權益（每筆平倉後）": curve}))
     else:
-        st.info("尚無資金曲線資料，按上方『更新持倉』會記錄一個點。")
+        st.info("尚無已平倉交易，沒有資金曲線。")
 
 # ---------------------------------------------------------------- 紀錄
 with tabs[5]:
