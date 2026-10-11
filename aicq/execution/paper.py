@@ -14,12 +14,11 @@ import pandas as pd
 from ..config import AppConfig
 from ..models import AccountState, DataGate, OpenPosition, TradeSignal
 from ..risk.manager import RiskManager
-from ..risk.sizing import round_conservative  # noqa: F401  (供外部引用)
-from ..timeutil import fmt_taipei, index_to_ms, taipei_day_key, tf_ms, to_ms, now_utc
+from ..timeutil import index_to_ms, taipei_day_key, tf_ms, to_ms, now_utc
 from ..backtest.fills import bar_exit, funding_cost
 from ..models import TradeRequest, Instrument
 from .guard import assert_paper_only
-from .storage import Storage
+from .storage import PositionLimitReached, Storage
 
 
 class PaperBroker:
@@ -56,14 +55,40 @@ class PaperBroker:
         dd = (np.maximum.accumulate(cum) - cum).max()
         return float(dd / self.initial_equity * 100)
 
+    def equity_curve(self) -> pd.Series:
+        """已實現權益曲線（每筆平倉後的權益，含起點）。回撤與日初權益都由資料庫紀錄推導，不依賴程式何時被開啟。"""
+        c = self.db.positions("closed")
+        if c.empty:
+            return pd.Series([self.initial_equity], index=pd.DatetimeIndex([pd.Timestamp("1970-01-01", tz="UTC")]))
+        c = c.assign(_t=pd.to_datetime(c["exit_time"], utc=True)).sort_values("_t")
+        eq = self.initial_equity + c["net_pnl"].cumsum()
+        return pd.Series(eq.to_numpy(), index=pd.DatetimeIndex(c["_t"]))
+
+    def max_drawdown_pct(self) -> float:
+        e = np.concatenate([[self.initial_equity], self.equity_curve().to_numpy()])
+        return float(((np.maximum.accumulate(e) - e) / np.maximum.accumulate(e)).max() * 100)
+
+    def day_start_equity(self, eq_now: float, now: pd.Timestamp) -> float:
+        """台北日初權益。取『由已平倉紀錄推導的日初已實現權益』與『當日首次記錄值』的較大者（較保守）。
+        這樣即使程式當天稍晚才啟動，早先的虧損仍會計入單日損失限制。
+        已知限制：跨日持有的未平倉單，其日初前的未實現損益無法還原。"""
+        key = int(taipei_day_key(to_ms(now)))
+        if self.db.get("day_key") != key:
+            self.db.set("day_key", key)
+            self.db.set("day_start_equity", eq_now)
+        snap = float(self.db.get("day_start_equity", eq_now))
+        day_start_ms = key * 86_400_000 - 8 * 3_600_000
+        c = self.db.positions("closed")
+        realized_before = 0.0
+        if len(c):
+            et = pd.to_datetime(c["exit_time"], utc=True)
+            realized_before = float(c.loc[et < pd.Timestamp(day_start_ms, unit="ms", tz="UTC"), "net_pnl"].sum())
+        return max(self.initial_equity + realized_before, snap)
+
     def account_state(self, marks: dict, now=None) -> AccountState:
         now = pd.Timestamp(now) if now is not None else now_utc()
         eq = self.equity(marks)
-        key = int(taipei_day_key(to_ms(now)))
-        if self.db.get("day_key") != key:      # 台北日換日：重設日初權益
-            self.db.set("day_key", key)
-            self.db.set("day_start_equity", eq)
-        day_start = float(self.db.get("day_start_equity", eq))
+        day_start = self.day_start_equity(eq, now)
         pos = []
         for _, r in self.db.positions("open").iterrows():
             pos.append(OpenPosition(r["symbol"], int(r["side"]), r["qty"], r["entry_price"], r["notional"],
@@ -78,6 +103,14 @@ class PaperBroker:
         now = pd.Timestamp(now) if now is not None else now_utc()
         if sig.direction not in ("long", "short") or sig.entry_ref is None or sig.stop is None or sig.tp1 is None:
             return False, "此訊號為觀望或條件不完整，不建立模擬單"
+        if not sig.bar_time:
+            return False, "訊號缺少 K 線時間，無法確認是否過期，已拒絕"
+        sig_close_ms = to_ms(sig.bar_time) + tf_ms(sig.timeframe)
+        age_bars = (to_ms(now) - sig_close_ms) / tf_ms(sig.timeframe)
+        if age_bars > self.cfg.risk.max_signal_age_bars:
+            msg = f"訊號已過期：K 線收盤後已過 {age_bars:.1f} 根週期（上限 {self.cfg.risk.max_signal_age_bars}），進場價已不具代表性"
+            self.db.log("WARN", f"{sig.symbol} {msg}")
+            return False, msg
         side = 1 if sig.direction == "long" else -1
         slip = self.cfg.cost.slippage_bps / 1e4
         fill = sig.entry_ref * (1 + side * slip)
@@ -100,9 +133,13 @@ class PaperBroker:
                                                       "regime": sig.regime_label}, ensure_ascii=False),
                    data_source=sig.data_source)
         try:
-            pid = self.db.insert_position(rec)
-        except sqlite3.IntegrityError:
-            return False, "此訊號已建立過模擬單（重複執行被阻擋）"
+            pid = self.db.insert_position(rec, max_open=self.cfg.risk.max_open_positions)
+        except PositionLimitReached as e:
+            return False, f"風控拒絕：{e}"
+        except sqlite3.IntegrityError as e:
+            if "signal_key" in str(e):
+                return False, "此訊號已建立過模擬單（重複執行被阻擋）"
+            return False, "風控拒絕：同商品已有未平倉持倉（資料庫層阻擋，禁止加碼／重複進場）"
         self.db.log("INFO", f"模擬開倉 #{pid} {sig.symbol} {sig.direction_label} qty={plan.qty} @ {fill:.4f}")
         return True, f"已建立模擬單 #{pid}：{sig.direction_label} {plan.qty} @ {fill:.4f}（風險約 {plan.risk_amount:.2f} USDT）"
 

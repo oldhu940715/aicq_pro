@@ -4,7 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from ..timeutil import from_ms, tf_ms, to_ms, now_utc
+from ..timeutil import from_ms, index_to_ms, now_utc, tf_ms, to_ms
 
 # (名稱, 每根漂移, 每根波動, 均值回歸強度)
 _REGIMES = [
@@ -54,10 +54,14 @@ def generate_synthetic_ohlcv(n: int, timeframe: str, seed: int = 7, start_price:
 
 
 def resample_ohlcv(df: pd.DataFrame, target_tf: str) -> pd.DataFrame:
-    """把較小週期 K 線聚合成較大週期，只保留『完整』的大週期 K 線（用於讓測試資料的多週期彼此一致）。"""
-    if df.empty:
-        return df
-    base_ms = int(np.median(np.diff(df.index.asi8 // 1_000_000))) if len(df) > 1 else tf_ms(target_tf)
+    """把較小週期 K 線聚合成較大週期，只保留『完整』的大週期 K 線（用於讓測試資料的多週期彼此一致）。
+    以 index_to_ms 取毫秒，與 pandas 的 datetime 解析度（ns/us/ms/s）無關。
+    """
+    if df.empty or len(df) < 2:
+        return df.iloc[:0]
+    base_ms = int(np.median(np.diff(index_to_ms(df.index))))
+    if base_ms <= 0 or tf_ms(target_tf) % base_ms:
+        raise ValueError(f"無法由 {base_ms // 1000}s K 線聚合為 {target_tf}")
     per = tf_ms(target_tf) // base_ms
     rule = f"{tf_ms(target_tf) // 60_000}min"
     g = df.resample(rule, closed="left", label="left")

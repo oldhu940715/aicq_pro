@@ -67,3 +67,43 @@ def compute_metrics(res: BacktestResult, prices: pd.DataFrame | None = None, cos
 
 def buy_hold_curve(prices: pd.DataFrame, initial: float) -> pd.Series:
     return prices["close"] / prices["open"].iloc[0] * initial
+
+
+def expectancy_ci(trades: pd.DataFrame, z: float = 1.96) -> dict:
+    """每筆期望值（R）的近似 95% 信賴區間（常態近似；交易數少時僅供參考）。"""
+    r = trades["r_multiple"].dropna().to_numpy(float) if len(trades) else np.array([])
+    n = len(r)
+    if n < 2:
+        return {"n": n, "mean_r": float(r.mean()) if n else float("nan"), "se": float("nan"),
+                "lo": float("nan"), "hi": float("nan"), "t_stat": float("nan")}
+    se = r.std(ddof=1) / np.sqrt(n)
+    m = float(r.mean())
+    return {"n": n, "mean_r": m, "se": float(se), "lo": m - z * se, "hi": m + z * se,
+            "t_stat": m / se if se > 0 else float("nan")}
+
+
+def oos_verdict(trades: pd.DataFrame, metrics: dict, min_trades: int = 30, max_dd_pct: float = 10.0) -> dict:
+    """樣本外判定。只有『足夠交易數＋期望值信賴區間下界>0＋獲利因子>1＋淨報酬>0＋回撤可接受』才算通過，
+    且『通過』也只代表『目前沒有被否定』，不是獲利保證。"""
+    ci = expectancy_ci(trades)
+    reasons = []
+    n = metrics.get("n_trades", 0)
+    if n == 0:
+        return {"status": "未驗證", "reasons": ["樣本外沒有任何成交交易，無法評估"], "ci": ci}
+    if n < min_trades:
+        reasons.append(f"交易數 {n} 少於 {min_trades}，統計上不足以判斷")
+    if not (ci["mean_r"] > 0):
+        reasons.append(f"每筆期望值 {ci['mean_r']:.3f}R ≤ 0")
+    elif not (ci["lo"] > 0):
+        reasons.append(f"期望值 95% 信賴區間下界 {ci['lo']:.3f}R ≤ 0，無法排除只是運氣")
+    pf = metrics.get("profit_factor", float("nan"))
+    if not (pf > 1):
+        reasons.append(f"獲利因子 {pf:.2f} ≤ 1")
+    if not (metrics.get("net_return_pct", 0) > 0):
+        reasons.append("扣成本後淨報酬 ≤ 0")
+    if metrics.get("max_drawdown_pct", 0) > max_dd_pct:
+        reasons.append(f"最大回撤 {metrics['max_drawdown_pct']:.1f}% 超過 {max_dd_pct}%")
+    if not reasons:
+        return {"status": "通過（尚未被否定）", "reasons": ["仍需更長期、跨行情、跨標的驗證；非獲利保證"], "ci": ci}
+    status = "證據不足" if (n < min_trades and ci["mean_r"] > 0) else "未通過"
+    return {"status": status, "reasons": reasons, "ci": ci}

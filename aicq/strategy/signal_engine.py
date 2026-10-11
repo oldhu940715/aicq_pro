@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
 
 from ..config import AppConfig, StrategyParams
 from ..data.provider import MarketData
@@ -90,7 +89,15 @@ def analyze_symbol(symbol: str, base_tf: str, base: MarketData, htf: MarketData 
     sig.regime_label = REGIME_LABELS.get(sig.regime, sig.regime)
     if htf is None or htf.df.empty:
         sig.uncertainties.append("缺少 1h 高週期資料，多週期判斷以『中性』處理。")
-    gate = DataGate(ok=base.ok, reasons=list(base.quality.issues) if base.quality else [], is_test_data=base.is_test_data)
+    gate_reasons = list(base.quality.issues) if base.quality else []
+    if base_tf != cfg.htf:     # 需要高週期趨勢時，高週期資料離線／過期／不足也必須擋單（不可靜默使用舊資料）
+        if htf is None or not htf.ok:
+            why = "；".join(htf.quality.issues) if (htf is not None and htf.quality is not None and htf.quality.issues) \
+                else ("離線或未提供" if htf is None or htf.source == "offline" else "品質檢查未通過")
+            gate_reasons.append(f"高週期 {cfg.htf} 資料不可用（{why}），無法判斷多週期趨勢")
+        elif len(htf.df) < p.htf_slow + 5:
+            gate_reasons.append(f"高週期 {cfg.htf} 資料僅 {len(htf.df)} 根，不足以計算 EMA{p.htf_slow} 趨勢")
+    gate = DataGate(ok=base.ok and not gate_reasons, reasons=gate_reasons, is_test_data=base.is_test_data)
     if not gate.ok:
         sig.rejection_reasons = gate.reasons or ["行情資料不可用"]
         sig.conditions = ["資料未通過檢查，停止產生可執行訊號"]
@@ -137,6 +144,8 @@ def analyze_symbol(symbol: str, base_tf: str, base: MarketData, htf: MarketData 
     plan = rm.evaluate(req, account, gate, inst)
     sig.plan = plan
     sig.rr_gross, sig.rr_net = plan.rr_gross, plan.rr_net
+    if plan.qty > 0:           # 顯示風控依 tick 保守取整後的實際止損／止盈價
+        sig.stop, sig.tp1 = plan.stop, plan.tp1
     sig.warnings += plan.warnings
     if plan.allowed:
         sig.direction = sig.candidate_direction

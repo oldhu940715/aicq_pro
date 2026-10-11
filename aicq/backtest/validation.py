@@ -15,7 +15,7 @@ from ..config import BacktestConfig, CostConfig, RiskConfig, StrategyParams
 from ..models import Instrument
 from ..strategy.strategies import prepare_dataset
 from .engine import BacktestResult, run_backtest
-from .metrics import compute_metrics, max_drawdown_pct
+from .metrics import compute_metrics
 
 
 def chronological_split(n: int, train: float = 0.5, val: float = 0.2, embargo: int = 0):
@@ -66,9 +66,10 @@ def walk_forward(base_df, htf_df, base_tf, htf_tf, grid, inst: Instrument, risk:
         for gi, (f, c) in enumerate(data):
             m = compute_metrics(run_segments(f, c, tr, inst, risk, cost, bt, base_tf))
             score = m.get(metric, float("nan"))
-            if m["n_trades"] >= min_train_trades and np.isfinite(score) and score > best_score:
+            # 必須『訓練期望值為正』才有資格被選用；否則該折不交易（不可挑「最不爛」的參數去賭）
+            if m["n_trades"] >= min_train_trades and np.isfinite(score) and score > 0 and score > best_score:
                 best, best_score, best_m = gi, score, m
-        row = {"fold": k, "train_start": base_df.index[tr.start], "test_start": base_df.index[te.start],
+        row = {"fold": k, "train_n_trades": best_m["n_trades"] if best_m else 0, "train_start": base_df.index[tr.start], "test_start": base_df.index[te.start],
                "test_end": base_df.index[te.stop - 1], "chosen_param": None, "train_score": np.nan,
                "oos_trades": 0, "oos_net_return_pct": 0.0, "oos_expectancy_r": np.nan}
         if best is not None:
@@ -83,7 +84,7 @@ def walk_forward(base_df, htf_df, base_tf, htf_tf, grid, inst: Instrument, risk:
             trades.append(r.trades.assign(fold=k))
             eqs.append(r.equity)
         else:
-            row["chosen_param"] = "（訓練窗無合格參數 → 該折不交易）"
+            row["chosen_param"] = "（訓練窗沒有交易數足夠且期望值為正的參數 → 該折不交易）"
             eqs.append(pd.Series(equity, index=base_df.index[te]))
         folds.append(row)
         start += step_bars
@@ -132,4 +133,41 @@ def regime_breakdown(trades: pd.DataFrame) -> pd.DataFrame:
     g = trades.groupby(["regime", "strategy"])
     out = g.agg(n=("net_pnl", "size"), net_pnl=("net_pnl", "sum"), expectancy_r=("r_multiple", "mean"),
                 win_rate_pct=("net_pnl", lambda s: (s > 0).mean() * 100)).reset_index()
+    return out
+
+
+def three_way_selection(feat_by_param: list, grid: list, base_df, inst, risk, cost, bt, tf,
+                        train: float = 0.5, val: float = 0.2, min_train_trades: int = 20,
+                        min_val_trades: int = 10, metric: str = "expectancy_r") -> dict:
+    """真正使用三段：訓練段選參數 → 驗證段把關 → 樣本外只在『已凍結參數且通過驗證』時評估一次。
+    feat_by_param：與 grid 對應的 [(feat, cand), ...]。回傳每組參數在訓練／驗證段的結果（含試驗次數，供多重比較警示）。"""
+    n = len(base_df)
+    tr, va, te = chronological_split(n, train, val, embargo=bt.max_hold_bars)
+    rows, best = [], None
+    for gi, ((f, c), p) in enumerate(zip(feat_by_param, grid)):
+        mt = compute_metrics(run_segments(f, c, tr, inst, risk, cost, bt, tf))
+        mv = compute_metrics(run_segments(f, c, va, inst, risk, cost, bt, tf))
+        ok_tr = mt["n_trades"] >= min_train_trades and np.isfinite(mt[metric]) and mt[metric] > 0
+        rows.append({"stop_atr_mult": p.stop_atr_mult, "tp_r": p.tp_r, "訓練_交易數": mt["n_trades"],
+                     "訓練_期望R": mt[metric], "驗證_交易數": mv["n_trades"], "驗證_期望R": mv[metric], "訓練合格": ok_tr})
+        if ok_tr and (best is None or mt[metric] > best[1]):
+            best = (gi, mt[metric], mt, mv)
+    out = {"table": pd.DataFrame(rows), "n_trials": len(grid), "chosen": None, "validation_passed": False,
+           "test": None, "message": ""}
+    if best is None:
+        out["message"] = f"訓練段沒有任何參數同時滿足『交易數≥{min_train_trades}且期望值為正』→ 不選參數、不進入樣本外測試。"
+        return out
+    gi, _, mt, mv = best
+    out["chosen"] = grid[gi]
+    out["train_metrics"], out["val_metrics"] = mt, mv
+    vscore = mv[metric]
+    if mv["n_trades"] >= min_val_trades and np.isfinite(vscore) and vscore > 0:
+        out["validation_passed"] = True
+        f, c = feat_by_param[gi]
+        r = run_segments(f, c, te, inst, risk, cost, bt, tf)
+        out["test"] = {"result": r, "metrics": compute_metrics(r, base_df.iloc[te], cost)}
+        out["message"] = "已在訓練段選定參數並通過驗證段把關；樣本外測試只對此凍結參數評估一次。"
+    else:
+        out["message"] = (f"訓練段選出的參數在驗證段未通過（交易數 {mv['n_trades']}，期望R {vscore if np.isfinite(vscore) else float('nan'):.3f}）"
+                          "→ 視為過度擬合訓練段，不進入樣本外測試。")
     return out

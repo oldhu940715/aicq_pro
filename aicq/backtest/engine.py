@@ -104,14 +104,18 @@ def run_backtest(feat: pd.DataFrame, cand: pd.DataFrame, inst: Instrument, risk:
                     pos = {"side": side, "qty": plan.qty, "entry": fill, "entry_ref": o[i], "stop": plan.stop,
                            "tp": plan.tp1, "i": i, "entry_ms": int(ms[i]), "fee_e": fee_e,
                            "strategy": str(strat_a[sb]), "regime": reg_a[sb], "evidence": int(ev_a[sb]),
-                           "risk_amount": plan.risk_amount}
+                           "risk_amount": plan.risk_amount, "liq": plan.liq_price}
                 else:
                     for r in plan.reasons:
                         blocked[re.sub(r"[\d.\-]+", "#", r)] += 1
         # 2) 出場
         if pos is not None:
             res = bar_exit(pos["side"], pos["stop"], pos["tp"], o[i], h[i], l[i], slip)
-            if res is not None:
+            liq = pos["liq"]
+            if res is not None and res[2] == "stop_gap" and liq is not None and \
+                    pos["side"] * (res[0] - liq) <= 0:      # 跳空直接越過粗估強平價：以強平價出場（逐倉損失上限≈保證金）
+                close(i, liq, liq, "liquidated", False)
+            elif res is not None:
                 close(i, res[0], res[1], res[2], res[3])
             elif i - pos["i"] + 1 >= bt.max_hold_bars:
                 close(i, c[i] * (1 - pos["side"] * slip), c[i], "time", False)

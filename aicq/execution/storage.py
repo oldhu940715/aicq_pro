@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS positions(
  risk_amount REAL, entry_fee REAL, opened_at TEXT, opened_ms INTEGER, eval_from_ms INTEGER,
  max_hold_bars INTEGER, status TEXT, exit_price REAL, exit_time TEXT, exit_reason TEXT, gross_pnl REAL,
  fees REAL, funding REAL, slippage_cost REAL, net_pnl REAL, reason TEXT, data_source TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_open_symbol ON positions(symbol) WHERE status='open';
 CREATE TABLE IF NOT EXISTS equity_points(ts TEXT, equity REAL);
 CREATE TABLE IF NOT EXISTS events(ts TEXT, level TEXT, message TEXT);
 CREATE TABLE IF NOT EXISTS backtest_runs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, kind TEXT,
@@ -31,6 +32,10 @@ CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class PositionLimitReached(Exception):
+    """已達最大持倉數（在資料庫交易內原子判斷，避免多個瀏覽器分頁同時下單造成超限）。"""
 
 
 class Storage:
@@ -84,12 +89,23 @@ class Storage:
                                      "regime,data_source FROM signals ORDER BY id DESC LIMIT ?", c, params=(limit,))
 
     # -- positions ------------------------------------------------------
-    def insert_position(self, rec: dict) -> int:
+    def insert_position(self, rec: dict, max_open: int | None = None) -> int:
+        """原子新增持倉。保證：同 signal_key 不重複（UNIQUE）、同商品最多一筆未平倉（部分唯一索引）、
+        未平倉總數不超過 max_open（同一個 SQL 陳述式內判斷）。違反時丟 sqlite3.IntegrityError／PositionLimitReached。"""
         cols = ",".join(rec)
         q = ",".join("?" * len(rec))
+        args = list(rec.values())
+        if max_open is None:
+            sql = f"INSERT INTO positions({cols}) VALUES ({q})"
+        else:
+            sql = (f"INSERT INTO positions({cols}) SELECT {q} "
+                   "WHERE (SELECT COUNT(*) FROM positions WHERE status='open') < ?")
+            args.append(int(max_open))
         with self._c() as c:
-            cur = c.execute(f"INSERT INTO positions({cols}) VALUES ({q})", tuple(rec.values()))
-            return cur.lastrowid  # IntegrityError（重複 signal_key）交由呼叫端處理
+            cur = c.execute(sql, args)
+            if cur.rowcount == 0:
+                raise PositionLimitReached(f"未平倉數已達上限 {max_open}")
+            return cur.lastrowid
 
     def positions(self, status: str | None = None) -> pd.DataFrame:
         q, a = "SELECT * FROM positions", ()
@@ -117,7 +133,18 @@ class Storage:
         with self._c() as c:
             return pd.read_sql_query("SELECT * FROM equity_points ORDER BY ts", c)
 
-    def save_backtest(self, kind: str, params: dict, metrics: dict):
+    def save_backtest(self, kind: str, params: dict, metrics: dict) -> int:
         with self._c() as c:
-            c.execute("INSERT INTO backtest_runs(created_at,kind,params,metrics) VALUES (?,?,?,?)",
-                      (_now(), kind, json.dumps(params, default=str), json.dumps(metrics, default=str)))
+            cur = c.execute("INSERT INTO backtest_runs(created_at,kind,params,metrics) VALUES (?,?,?,?)",
+                            (_now(), kind, json.dumps(params, default=str, ensure_ascii=False),
+                             json.dumps(metrics, default=str, ensure_ascii=False)))
+            return cur.lastrowid
+
+    def backtest_runs(self, limit: int = 50) -> pd.DataFrame:
+        with self._c() as c:
+            return pd.read_sql_query("SELECT id,created_at,kind,params,metrics FROM backtest_runs ORDER BY id DESC LIMIT ?",
+                                     c, params=(limit,))
+
+    def count_backtests(self) -> int:
+        with self._c() as c:
+            return int(c.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0])

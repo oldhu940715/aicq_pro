@@ -18,6 +18,7 @@ class RiskConfig:
     liq_safety_ratio: float = 0.5         # 止損距離須 <= 此比例 * 強平距離
     strategy_max_drawdown_pct: float = 10.0  # 策略回撤達此值即停用新倉
     max_data_age_bars: float = 2.5        # 最後一根 K 線收盤後超過幾根週期視為過期
+    max_signal_age_bars: float = 1.0      # 模擬下單時，訊號 K 線收盤已超過幾根週期則視為過期、拒絕成交
 
 
 @dataclass(frozen=True)
